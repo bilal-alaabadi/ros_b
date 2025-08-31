@@ -6,9 +6,6 @@ const verifyAdmin = require("../middleware/verifyAdmin");
 const router = express.Router();
 const axios = require("axios");
 require("dotenv").config();
-// import axios from 'axios';
-// import Order from '../models/Order.js';            // تأكد من المسار
-// import { sendOrderWhatsApp, notifyAdmin } from '../utils/whatsapp.js';
 
 const THAWANI_API_KEY = process.env.THAWANI_API_KEY; 
 const THAWANI_API_URL = process.env.THAWANI_API_URL;
@@ -21,20 +18,40 @@ app.use(express.json());
 // Create checkout session
 // ========================= routes/orders.js (create-checkout-session) =========================
 // ===== Helpers =====
+// ========================= routes/create-checkout-session (نهائي) =========================
+const ORDER_CACHE = new Map(); // key: client_reference_id -> value: orderPayload
+
+// ===== Helpers =====
 const toBaisa = (omr) => Math.max(100, Math.round(Number(omr || 0) * 1000)); // >= 100 بيسة
 
 // خصم الأزواج للشيلات (ر.ع.)
 const pairDiscountForProduct = (p) => {
-  const isShayla =
-    p.category === "الشيلات فرنسية" || p.category === "الشيلات سادة";
+  const isShayla = p.category === "الشيلات فرنسية" || p.category === "الشيلات سادة";
   if (!isShayla) return 0;
   const qty = Number(p.quantity || 0);
   const pairs = Math.floor(qty / 2);
   return pairs * 1; // 1 ر.ع لكل زوج
 };
 
-// ===== Route =====
-// ========================= routes/orders.js (create-checkout-session) =========================
+// هل تحتوي بطاقة الهدية على أي قيمة؟
+const hasGiftValues = (gc) => {
+  if (!gc || typeof gc !== "object") return false;
+  const v = (x) => (x ?? "").toString().trim();
+  return !!(v(gc.from) || v(gc.to) || v(gc.phone) || v(gc.note));
+};
+
+// تطبيع بطاقة الهدية إلى شكل ثابت
+const normalizeGift = (gc) =>
+  hasGiftValues(gc)
+    ? {
+        from: gc.from || "",
+        to: gc.to || "",
+        phone: gc.phone || "",
+        note: gc.note || "",
+      }
+    : undefined;
+
+// ========================= create-checkout-session =========================
 router.post("/create-checkout-session", async (req, res) => {
   const {
     products,
@@ -45,30 +62,24 @@ router.post("/create-checkout-session", async (req, res) => {
     wilayat,
     description,
     depositMode, // إذا true: المقدم 10 ر.ع (من ضمنه التوصيل)
-    giftCard,    // { from, to, phone, note } اختياري
+    giftCard,    // { from, to, phone, note } اختياري (على مستوى الطلب)
+    gulfCountry, // الدولة المختارة داخل "دول الخليج" (إن وُجدت)
   } = req.body;
 
-  const shippingFee = country === "الإمارات" ? 4 : 2; // (ر.ع.)
+  // رسوم الشحن (ر.ع.)
+  const shippingFee =
+    country === "دول الخليج"
+      ? (gulfCountry === "الإمارات" ? 4 : 5)
+      : 2;
+
   const DEPOSIT_AMOUNT_OMR = 10; // المقدم الثابت
 
   if (!Array.isArray(products) || products.length === 0) {
     return res.status(400).json({ error: "Invalid or empty products array" });
   }
 
-  // تحويل ريال عماني إلى بيسة مع حد أدنى 100 بيسة
-  const toBaisa = (amountOMR) => Math.max(100, Math.round(Number(amountOMR || 0) * 1000));
-
-  // خصم الأزواج للشيلات (ر.ع.)
-  const pairDiscountForProduct = (p) => {
-    const isShayla = p.category === "الشيلات فرنسية" || p.category === "الشيلات سادة";
-    if (!isShayla) return 0;
-    const qty = Number(p.quantity || 0);
-    const pairs = Math.floor(qty / 2);
-    return pairs * 1; // 1 ر.ع لكل زوج
-  };
-
   try {
-    // مجاميع أصلية (لحساب السعر الكامل والمتبقي)
+    // المجاميع كما في Checkout.jsx
     const productsSubtotal = products.reduce(
       (sum, p) => sum + Number(p.price || 0) * Number(p.quantity || 0),
       0
@@ -78,7 +89,7 @@ router.post("/create-checkout-session", async (req, res) => {
       0
     );
     const subtotalAfterDiscount = Math.max(0, productsSubtotal - totalPairDiscount);
-    const originalTotal = subtotalAfterDiscount + shippingFee; // السعر الأصلي (منتجات بعد الخصم + شحن)
+    const originalTotal = subtotalAfterDiscount + shippingFee;
 
     let lineItems = [];
     let amountToCharge = 0;
@@ -86,11 +97,7 @@ router.post("/create-checkout-session", async (req, res) => {
     if (depositMode) {
       // دفعة مقدم 10 ر.ع (من ضمنه التوصيل)
       lineItems = [
-        {
-          name: "دفعة مقدم",
-          quantity: 1,
-          unit_amount: toBaisa(DEPOSIT_AMOUNT_OMR),
-        },
+        { name: "دفعة مقدم", quantity: 1, unit_amount: toBaisa(DEPOSIT_AMOUNT_OMR) },
       ];
       amountToCharge = DEPOSIT_AMOUNT_OMR;
     } else {
@@ -119,6 +126,39 @@ router.post("/create-checkout-session", async (req, res) => {
 
     const nowId = Date.now().toString();
 
+    // حمولة الطلب الكاملة التي سنحفظها لاحقًا بعد نجاح الدفع فقط
+    const orderPayload = {
+      orderId: nowId,
+      products: products.map((p) => ({
+        productId: p._id,
+        quantity: p.quantity,
+        name: p.name,
+        price: p.price, // ر.ع.
+        image: Array.isArray(p.image) ? p.image[0] : p.image,
+        measurements: p.measurements || {},
+        category: p.category || "",
+        // ✅ بطاقة الهدية على مستوى "كل منتج"
+        giftCard: normalizeGift(p.giftCard) || undefined,
+      })),
+      amountToCharge,            // ما يُتوقع دفعه الآن
+      shippingFee,               // محفوظ للحسابات
+      customerName,
+      customerPhone,
+      country,
+      wilayat,
+      description,
+      email: email || "",
+      status: "completed",       // سيُحفظ فعليًا عند النجاح فقط
+      depositMode: !!depositMode,
+      remainingAmount: depositMode ? Math.max(0, originalTotal - DEPOSIT_AMOUNT_OMR) : 0,
+      // ✅ إبقاء الحقل العام للتوافق — سيتم استخدامه فقط إذا لم توضع بطاقات على مستوى المنتجات
+      giftCard: normalizeGift(giftCard),
+    };
+
+    // نخزّن الحمولة مؤقتًا في الذاكرة بدل metadata الكبيرة
+    ORDER_CACHE.set(nowId, orderPayload);
+
+    // نرسل لثواني فقط Meta خفيفة
     const data = {
       client_reference_id: nowId,
       mode: "payment",
@@ -135,7 +175,6 @@ router.post("/create-checkout-session", async (req, res) => {
         shippingFee: String(shippingFee),
         internal_order_id: String(nowId),
         source: "mern-backend",
-        pair_discount_total_omr: String(totalPairDiscount),
       },
     };
 
@@ -148,6 +187,7 @@ router.post("/create-checkout-session", async (req, res) => {
 
     const sessionId = response?.data?.data?.session_id;
     if (!sessionId) {
+      ORDER_CACHE.delete(nowId); // تنظيف لو فشل الإنشاء
       return res.status(500).json({
         error: "No session_id returned from Thawani",
         details: response?.data,
@@ -156,45 +196,7 @@ router.post("/create-checkout-session", async (req, res) => {
 
     const paymentLink = `https://uatcheckout.thawani.om/pay/${sessionId}?key=${publish_key}`;
 
-    // حساب المتبقي: (السعر الأصلي) - 10
-    const remainingAmount = depositMode ? Math.max(0, originalTotal - DEPOSIT_AMOUNT_OMR) : 0;
-
-    // إنشاء الطلب + حفظ بيانات بطاقة الهدية (إن وُجدت)
-    const order = new Order({
-      orderId: nowId,
-      products: products.map((p) => ({
-        productId: p._id,
-        quantity: p.quantity,
-        name: p.name,
-        price: p.price, // ر.ع.
-        image: Array.isArray(p.image) ? p.image[0] : p.image,
-        measurements: p.measurements || {},
-        category: p.category || "",
-      })),
-      amount: amountToCharge,    // المدفوع الآن
-      shippingFee: shippingFee,  // محفوظ دائماً للحسابات
-      customerName,
-      customerPhone,
-      country,
-      wilayat,
-      description,
-      email: email || "",
-      status: "pending",
-      depositMode: !!depositMode,
-      remainingAmount,
-
-      giftCard: giftCard
-        ? {
-            from: giftCard.from || "",
-            to: giftCard.to || "",
-            phone: giftCard.phone || "",
-            note: giftCard.note || "",
-          }
-        : undefined, // لو ما أرسل، لا نكتب الحقل (وسيأخذ Default من الموديل عند الحاجة)
-    });
-
-    await order.save();
-
+    // لا نحفظ في القاعدة هنا
     res.json({ id: sessionId, paymentLink });
   } catch (error) {
     console.error("Error creating checkout session:", error?.response?.data || error);
@@ -234,15 +236,31 @@ function calculateProductPrice(product, quantity, selectedSize) {
     }
     return (product.regularPrice * quantity).toFixed(2);
 }
-// Confirm payment
+
 // ========================= routes/orders.js (confirm-payment) =========================
-// ========================= routes/orders.js (confirm-payment النهائي) =========================
+// ========================= routes/confirm-payment (نهائي) =========================
 router.post("/confirm-payment", async (req, res) => {
   const { client_reference_id } = req.body;
 
   if (!client_reference_id) {
     return res.status(400).json({ error: "Session ID is required" });
   }
+
+  // Helpers محليّة للتطبيع
+  const hasGiftValues = (gc) => {
+    if (!gc || typeof gc !== "object") return false;
+    const v = (x) => (x ?? "").toString().trim();
+    return !!(v(gc.from) || v(gc.to) || v(gc.phone) || v(gc.note));
+  };
+  const normalizeGift = (gc) =>
+    hasGiftValues(gc)
+      ? {
+          from: gc.from || "",
+          to: gc.to || "",
+          phone: gc.phone || "",
+          note: gc.note || "",
+        }
+      : undefined;
 
   try {
     // 1) جلب قائمة الجلسات ثم إيجاد الجلسة بالـ client_reference_id
@@ -285,7 +303,7 @@ router.post("/confirm-payment", async (req, res) => {
         .json({ error: "Payment not successful or session not found" });
     }
 
-    // 3) قراءة الميتاداتا (نفس ما أرسلناه في الإنشاء)
+    // 3) ميتاداتا خفيفة
     const meta = session?.metadata || session?.meta_data || {};
     const metaCustomerName = meta.customer_name || "";
     const metaCustomerPhone = meta.customer_phone || "";
@@ -296,40 +314,70 @@ router.post("/confirm-payment", async (req, res) => {
     const metaShippingFee =
       typeof meta.shippingFee !== "undefined" ? Number(meta.shippingFee) : undefined;
 
-    // 4) تحديث الطلب (نبحث باستخدام client_reference_id أولاً)
+    // 4) احتمال وجود طلب سابق
     let order = await Order.findOne({ orderId: client_reference_id });
 
-    // احتياط: إن لم نجده (حالات نادرة جداً)
-    if (!order) {
-      order = await Order.findOne({ orderId: session_id });
-    }
-
-    // المبلغ المدفوع فعلياً من ثواني (بالريال العُماني)
+    // المبلغ المدفوع فعليًا (من ثواني) بالريال
     const paidAmountOMR = Number(session.total_amount || 0) / 1000;
 
+    // نجلب الكاش
+    const cached = ORDER_CACHE.get(client_reference_id) || {};
+
+    // تطبيع المنتجات من الكاش مع تضمين بطاقة الهدية على مستوى كل منتج
+    // ملاحظة: لا نُنشئ بطاقات وهمية؛ فقط نحترم الموجود في كل عنصر.
+    const productsFromCache = Array.isArray(cached.products)
+      ? cached.products.map((p) => {
+          const giftCard = normalizeGift(p.giftCard); // إن وُجدت على مستوى المنتج
+          return {
+            productId: p.productId || p._id,
+            quantity: p.quantity,
+            name: p.name,
+            price: p.price, // ر.ع.
+            image: Array.isArray(p.image) ? p.image[0] : p.image,
+            category: p.category || "",
+            measurements: p.measurements || {},
+            giftCard, // <-- تُحفظ فقط إن كانت موجودة فعلاً
+          };
+        })
+      : [];
+
+    // fallback ذكي لرسوم الشحن إذا لم تتوفر
+    const resolvedShippingFee = (() => {
+      if (typeof metaShippingFee !== "undefined") return metaShippingFee;
+      if (typeof cached.shippingFee !== "undefined") return Number(cached.shippingFee);
+      const country = (cached.country || metaCountry || "").trim();
+      const gulfCountryFromMeta = (meta.gulfCountry || meta.gulf_country || "").trim();
+      if (country === "دول الخليج") {
+        return gulfCountryFromMeta === "الإمارات" ? 4 : 5; // ر.ع
+      }
+      return 2; // ر.ع داخل عُمان
+    })();
+
+    // 5) أنشئ/حدّث الطلب
     if (!order) {
-      // إنشاء طلب احتياطي بالحد الأدنى من البيانات (في حال لم يُحفظ قبل إنشاء الجلسة)
+      const orderLevelGift = normalizeGift(cached.giftCard);
+
       order = new Order({
-        orderId: client_reference_id,
-        products: [], // لا تتوفر بنية المنتجات كاملة من ثواني هنا
-        amount: paidAmountOMR,
-        shippingFee:
-          typeof metaShippingFee !== "undefined" ? metaShippingFee : 2,
-        customerName: metaCustomerName,
-        customerPhone: metaCustomerPhone,
-        country: metaCountry,
-        wilayat: metaWilayat,
-        description: metaDescription,
-        email: metaEmail,
+        orderId: cached.orderId || client_reference_id,
+        products: productsFromCache, // <-- كل منتج يحتفظ ببطاقة هديته إن وُجدت
+        amount: paidAmountOMR, // المدفوع فعليًا
+        shippingFee: resolvedShippingFee,
+        customerName: cached.customerName || metaCustomerName,
+        customerPhone: cached.customerPhone || metaCustomerPhone,
+        country: cached.country || metaCountry,
+        wilayat: cached.wilayat || metaWilayat,
+        description: cached.description || metaDescription,
+        email: cached.email || metaEmail,
         status: "completed",
-        // ملاحظة: لا نضع/نغيّر depositMode أو remainingAmount هنا لعدم معرفتنا بهما
+        depositMode: !!cached.depositMode,
+        remainingAmount: Number(cached.remainingAmount || 0),
+        giftCard: orderLevelGift, // (اختياري) الحقل العام
       });
     } else {
-      // تحديث الحقول الأساسية فقط
+      // تحديث الطلب الموجود
       order.status = "completed";
-      order.amount = paidAmountOMR; // ما تم دفعه فعلياً لدى ثواني
+      order.amount = paidAmountOMR;
 
-      // تعبئة أي معلومات ناقصة من الميتاداتا
       if (!order.customerName && metaCustomerName) order.customerName = metaCustomerName;
       if (!order.customerPhone && metaCustomerPhone) order.customerPhone = metaCustomerPhone;
       if (!order.country && metaCountry) order.country = metaCountry;
@@ -337,12 +385,18 @@ router.post("/confirm-payment", async (req, res) => {
       if (!order.description && metaDescription) order.description = metaDescription;
       if (!order.email && metaEmail) order.email = metaEmail;
 
-      // لا نغيّر depositMode أو remainingAmount المحفوظين مسبقًا
-      if (
-        (order.shippingFee === undefined || order.shippingFee === null) &&
-        typeof metaShippingFee !== "undefined"
-      ) {
-        order.shippingFee = metaShippingFee;
+      if (order.shippingFee === undefined || order.shippingFee === null) {
+        order.shippingFee = resolvedShippingFee;
+      }
+
+      // لو لدينا منتجات من الكاش (الأحدث)، نُحدّث قائمة المنتجات كاملة
+      if (productsFromCache.length > 0) {
+        order.products = productsFromCache;
+      }
+
+      // نطبّع البطاقة العامة إن كانت غير محفوظة
+      if (!hasGiftValues(order.giftCard) && hasGiftValues(cached.giftCard)) {
+        order.giftCard = normalizeGift(cached.giftCard);
       }
     }
 
@@ -351,6 +405,9 @@ router.post("/confirm-payment", async (req, res) => {
     order.paidAt = new Date();
 
     await order.save();
+
+    // تنظيف الكاش بعد الحفظ
+    ORDER_CACHE.delete(client_reference_id);
 
     res.json({ order });
   } catch (error) {
@@ -361,6 +418,8 @@ router.post("/confirm-payment", async (req, res) => {
     });
   }
 });
+
+
 // Get order by email
 router.get("/:email", async (req, res) => {
     const email = req.params.email;

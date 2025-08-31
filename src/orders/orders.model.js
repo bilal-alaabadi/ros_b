@@ -1,4 +1,4 @@
-// ========================= models/Order.js =========================
+// ========================= models/Order.js (نهائي) =========================
 const mongoose = require("mongoose");
 
 const GiftCardSchema = new mongoose.Schema(
@@ -31,6 +31,8 @@ const OrderSchema = new mongoose.Schema(
           color: { type: String },
           buttons: { type: String },
         },
+        // ✅ بطاقة الهدية على مستوى كل منتج
+        giftCard: { type: GiftCardSchema, default: undefined },
       },
     ],
 
@@ -62,8 +64,8 @@ const OrderSchema = new mongoose.Schema(
     depositMode: { type: Boolean, default: false },
     remainingAmount: { type: Number, default: 0 },
 
-    // ==== بطاقة الهدية ====
-    giftCard: { type: GiftCardSchema, default: () => ({}) },
+    // ==== بطاقة الهدية (على مستوى الطلب للتوافق) ====
+    giftCard: { type: GiftCardSchema, default: undefined },
   },
   { timestamps: true }
 );
